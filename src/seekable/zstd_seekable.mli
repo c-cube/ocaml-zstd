@@ -5,8 +5,7 @@
     stream, so any standard decoder (including {!Zstd.Decompress_stream}) can
     decode it linearly. *)
 
-(** {1 Seekable Compression} *)
-
+(** Seekable Compression *)
 module Compress : sig
   type t
 
@@ -64,8 +63,7 @@ module Compress : sig
   val close : t -> unit
 end
 
-(** {1 Seekable Decompression} *)
-
+(** Seekable Decompression *)
 module Decompress : sig
   module Reader : sig
     (** An abstraction over the underlying file to read. We require the file to
