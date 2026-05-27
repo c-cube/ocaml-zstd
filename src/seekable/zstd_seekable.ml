@@ -1,8 +1,15 @@
-(* Seekable format constants *)
+
+(* This module assumes a 64-bit OCaml runtime: the u32 byte arithmetic below
+   would overflow on large u32 values. *)
+let () = assert (Sys.word_size >= 64)
+
+(* ----- Seekable format constants ------------------------------------------ *)
 
 let seekable_magic = 0x8F92EAB1
 let skippable_magic = 0x184D2A5E
-let footer_size = 9
+let footer_size = 9    (* Number_Of_Frames u32 + Descriptor u8 + Magic u32 *)
+let entry_size_no_checksum = 8     (* Compressed_Size u32 + Decompressed_Size u32 *)
+let entry_size_with_checksum = 12  (* + Frame_Checksum u32, not validated by reader *)
 
 let u32_le_of_bytes b off =
   let b0 = Char.code (Bytes.unsafe_get b off) in
@@ -51,6 +58,7 @@ module Compress = struct
       comp_in_frame := !comp_in_frame + len;
       writer b off len
     in
+    (* [?checksum] enables libzstd's per-frame XXH64, not the seektable checksum *)
     let engine = Compress_engine.create ?level ~checksum ~writer:wrapped_writer () in
     { engine; user_writer = writer; policy = frame_size;
       comp_in_frame; uncomp_in_frame;
@@ -64,7 +72,7 @@ module Compress = struct
     if !(s.uncomp_in_frame) = 0 then ()
     else begin
       Compress_engine.end_frame s.engine;
-      let entry = Bytes.create 8 in
+      let entry = Bytes.create entry_size_no_checksum in
       bytes_set_u32_le entry 0 !(s.comp_in_frame);
       bytes_set_u32_le entry 4 !(s.uncomp_in_frame);
       Buffer.add_bytes s.entries entry;
@@ -113,8 +121,8 @@ module Compress = struct
      bypass the wrapped writer so it does not get counted into
      [comp_in_frame]. *)
   let write_seek_table s =
-    let n = Buffer.length s.entries / 8 in
-    let entries_size = n * 8 in
+    let n = Buffer.length s.entries / entry_size_no_checksum in
+    let entries_size = n * entry_size_no_checksum in
     let total_payload = entries_size + footer_size in
     (* skippable frame header: magic + Frame_Size = total_payload *)
     let header = Bytes.create 8 in
@@ -225,6 +233,8 @@ module Decompress = struct
       "{@[compressed=%d; decompressed=%d;@ comp_offset=%d; uncomp_offset=%d@]}"
       fi.compressed fi.decompressed fi.comp_offset fi.uncomp_offset
 
+  (* Debug-only: prints every frame, no truncation. For tables with very many
+     frames this can produce a lot of output. *)
   let pp_table fmt t =
     Format.fprintf fmt "@[<hov>";
     for i = 0 to t.n_frames - 1 do
@@ -257,7 +267,10 @@ module Decompress = struct
     let n = u32_le_of_bytes footer 0 in
     let* () = guard (n >= 0) in
     let desc = Char.code (Bytes.unsafe_get footer 4) in
-    let entry_size = if desc land 0x80 <> 0 then 12 else 8 in
+    let entry_size =
+      if desc land 0x80 <> 0 then entry_size_with_checksum
+      else entry_size_no_checksum
+    in
     let entries_size = n * entry_size in
     let frame_size = entries_size + footer_size in
     let skippable_start = total_len - frame_size - 8 in

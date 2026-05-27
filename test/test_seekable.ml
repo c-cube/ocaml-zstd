@@ -181,7 +181,7 @@ let test_seekable () =
   in
   printf "  seekable 4. per-frame checksum: OK\n";
 
-  (* 6. Edge cases: find_table on plain zstd returns None; seek past EOF
+  (* 5. Edge cases: find_table on plain zstd returns None; seek past EOF
      then read returns 0. *)
   let () =
     let plain = stream_compress (mk_data 1024) in
@@ -209,9 +209,9 @@ let test_seekable () =
     assert (n = 0);
     DS.close dec
   in
-  printf "  seekable 6. edge cases: OK\n";
+  printf "  seekable 5. edge cases: OK\n";
 
-  (* 7. Manual frame policy + current_frame_size: write fixed-size "items" and
+  (* 6. Manual frame policy + current_frame_size: write fixed-size "items" and
      close the frame whenever adding the next item would push the frame past a
      target uncompressed size. Verify item-aligned frame boundaries. *)
   let () =
@@ -250,7 +250,7 @@ let test_seekable () =
     let expected = String.concat "" (List.init n_items (fun _ -> Bytes.to_string item)) in
     if got <> expected then failwith "manual: round-trip mismatch"
   in
-  printf "  seekable 7. manual policy + current_frame_size: OK\n";
+  printf "  seekable 6. manual policy + current_frame_size: OK\n";
   printf "All seekable tests passed.\n"
 
 ;;
