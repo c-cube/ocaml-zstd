@@ -58,6 +58,21 @@ module Compress : sig
       frame past a target threshold. *)
   val current_frame_size : t -> int * int
 
+  (** [add_skippable_frame t ~magic content i len] writes a zstd skippable frame
+      (an 8-byte header followed by [content[i..i+len]] verbatim) to the output.
+      [magic] must be in the skippable range [[0x184D2A50, 0x184D2A5F]].
+
+      Skippable frames are ignored by every zstd decoder, so this is a way
+      to embed arbitrary metadata (a custom header, dictionary id, …) in the
+      stream. It may be called at any point — before, between, or after data
+      frames. Each skippable frame is recorded in the seek table as its own
+      entry (with a decompressed size of 0), so the cumulative frame offsets
+      stay consistent and the decoder skips over it transparently. If a data
+      frame is currently open, it is ended first so that frame order in the
+      file matches seek-table-entry order. Raises {!Zstd.Error} if [t] is
+      closed, and [Invalid_argument] if [magic] is out of range. *)
+  val add_skippable_frame : t -> magic:int -> bytes -> int -> int -> unit
+
   (** [close t] ends the current frame and writes the seek table skippable
       frame. Idempotent. *)
   val close : t -> unit
@@ -73,9 +88,11 @@ module Decompress : sig
       read : bytes -> int -> int -> int;
         (** [read buf off len] reads at most [len] bytes from the current
             position, returns the number of bytes actually read (0 on EOF). *)
-      seek : int -> unit;
-        (** [seek pos] moves the cursor to absolute byte offset [pos]. *)
-      length : unit -> int;
+      seek : int64 -> unit;
+        (** [seek pos] moves the cursor to absolute byte offset [pos]. The
+            offset is an [int64] so inputs larger than [max_int] are
+            representable. *)
+      length : unit -> int64;
         (** [length ()] returns the total size of the input in bytes. *)
     }
 
@@ -92,10 +109,14 @@ module Decompress : sig
   (** [find_table reader] reads the trailing skippable frame and returns
       [Some table] when present. Returns [None] for any plain zstd file or
       malformed footer — this includes: file too short, missing or wrong
-      magic, inconsistent skippable [Frame_Size], or a self-inconsistent
-      table whose cumulative frame sizes plus header plus footer do not
-      match the file length (e.g. a seekable file with trailing bytes
-      appended, or two seekable files concatenated). [None] is therefore
+      magic, inconsistent skippable [Frame_Size], or declared frame sizes
+      that do not fit in the space before the skippable frame (base < 0).
+      Arbitrary leading content before the data frames is tolerated: the
+      seek table records all indexed frames (data and skippable), and any
+      unindexed bytes form a leading region at offset [base]. For files
+      written by this library, every frame is indexed and [base = 0].
+      Trailing bytes after the seek-table footer are NOT tolerated (the
+      footer must be the last bytes of the file). [None] is therefore
       "no usable seek table here", not strictly "no magic present".
       Raises {!Zstd.Error} only on IO or libzstd errors. *)
   val find_table : Reader.t -> table option
@@ -109,7 +130,7 @@ module Decompress : sig
   type frame_info = {
     compressed : int;
     decompressed : int;
-    comp_offset : int;     (** start offset of the frame in the compressed stream *)
+    comp_offset : int;     (** absolute byte offset of the frame's start in the input *)
     uncomp_offset : int;   (** start offset of the frame in the uncompressed stream *)
   }
 

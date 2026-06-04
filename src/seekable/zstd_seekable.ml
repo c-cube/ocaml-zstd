@@ -7,9 +7,11 @@ let () = assert (Sys.word_size >= 64)
 
 let seekable_magic = 0x8F92EAB1
 let skippable_magic = 0x184D2A5E
-let footer_size = 9    (* Number_Of_Frames u32 + Descriptor u8 + Magic u32 *)
-let entry_size_no_checksum = 8     (* Compressed_Size u32 + Decompressed_Size u32 *)
-let entry_size_with_checksum = 12  (* + Frame_Checksum u32, not validated by reader *)
+let footer_size = 9 (** Number_Of_Frames u32 + Descriptor u8 + Magic u32 *)
+
+let entry_size_no_checksum = 8 (** Compressed_Size u32 + Decompressed_Size u32 *)
+
+let entry_size_with_checksum = 12 (** + Frame_Checksum u32, not validated by reader *)
 
 let u32_le_of_bytes b off =
   let b0 = Char.code (Bytes.unsafe_get b off) in
@@ -26,6 +28,27 @@ let bytes_set_u32_le b off v =
   Bytes.unsafe_set b (off + 2) (Char.unsafe_chr ((v lsr 16) land 0xff));
   Bytes.unsafe_set b (off + 3) (Char.unsafe_chr ((v lsr 24) land 0xff))
 
+(** A tiny growable byte buffer. Unlike [Buffer], it exposes its backing
+   [bytes] to avoid copies. *)
+module Byte_buffer = struct
+  type t = { mutable bytes: bytes; mutable len: int }
+
+  let create n = { bytes = Bytes.create (max 8 n); len = 0 }
+
+  (** Ensure room for at least [extra] more bytes past [len], growing
+      geometrically and preserving the existing contents. *)
+  let ensure t extra =
+    let need = t.len + extra in
+    if need > Bytes.length t.bytes then begin
+      assert (need <= Sys.max_string_length);
+      let cap = ref (Bytes.length t.bytes) in
+      while !cap < need do cap := !cap * 2 done;
+      let new_bytes = Bytes.create !cap in
+      Bytes.blit t.bytes 0 new_bytes 0 t.len;
+      t.bytes <- new_bytes
+    end
+end
+
 module Compress = struct
   module Compress_engine = Zstd.Internal.Compress_engine
 
@@ -38,13 +61,13 @@ module Compress = struct
     engine: Compress_engine.t;
     user_writer: bytes -> int -> int -> unit;
     policy: frame_size_policy;
+    mutable comp_in_frame: int;
     (** per-frame counters. [comp_in_frame] is updated from the wrapper
         writer that sits between the engine and the user. *)
-    comp_in_frame: int ref;
-    uncomp_in_frame: int ref;
+    mutable uncomp_in_frame: int;
+    entries: Byte_buffer.t;
     (** collected entries: concatenation of (comp_u32 ; uncomp_u32),
         8 bytes per entry. *)
-    entries: Buffer.t;
   }
 
   let create ?level ?(frame_size=Uncompressed (2 * 1024 * 1024)) ?(checksum=false) ~writer () =
@@ -52,56 +75,63 @@ module Compress = struct
      | Uncompressed n | Compressed n ->
        if n <= 0 then invalid_arg "Seekable.Compress.create: frame_size must be > 0"
      | Manual -> ());
-    let comp_in_frame = ref 0 in
-    let uncomp_in_frame = ref 0 in
+    let self = ref None in
     let wrapped_writer b off len =
-      comp_in_frame := !comp_in_frame + len;
+      (match !self with
+       | Some s -> s.comp_in_frame <- s.comp_in_frame + len
+       | None -> ());
       writer b off len
     in
     (* [?checksum] enables libzstd's per-frame XXH64, not the seektable checksum *)
     let engine = Compress_engine.create ?level ~checksum ~writer:wrapped_writer () in
-    { engine; user_writer = writer; policy = frame_size;
-      comp_in_frame; uncomp_in_frame;
-      entries = Buffer.create 64 }
+    let s =
+      { engine; user_writer = writer; policy = frame_size;
+        comp_in_frame = 0; uncomp_in_frame = 0;
+        entries = Byte_buffer.create 64 }
+    in
+    self := Some s;
+    s
 
   let is_closed s = Compress_engine.is_closed s.engine
 
-  let force_end_frame s =
-    if Compress_engine.is_closed s.engine then
+  (* Append one 8-byte seek-table entry (Compressed_Size ; Decompressed_Size)
+     in place, no temporary. Shared by data frames and skippable frames (the
+     latter carry [decomp = 0]). *)
+  let add_seektable_entry self ~comp ~decomp : unit =
+    let e = self.entries in
+    Byte_buffer.ensure e entry_size_no_checksum;
+    bytes_set_u32_le e.bytes e.len comp;
+    bytes_set_u32_le e.bytes (e.len + 4) decomp;
+    e.len <- e.len + entry_size_no_checksum
+
+  let force_end_frame self =
+    if Compress_engine.is_closed self.engine then
       raise (Zstd.Error "stream is closed");
-    if !(s.uncomp_in_frame) = 0 then ()
+    if self.uncomp_in_frame = 0 then ()
     else begin
-      Compress_engine.end_frame s.engine;
-      let entry = Bytes.create entry_size_no_checksum in
-      bytes_set_u32_le entry 0 !(s.comp_in_frame);
-      bytes_set_u32_le entry 4 !(s.uncomp_in_frame);
-      Buffer.add_bytes s.entries entry;
-      s.comp_in_frame := 0;
-      s.uncomp_in_frame := 0
+      Compress_engine.end_frame self.engine;
+      add_seektable_entry self ~comp:self.comp_in_frame ~decomp:self.uncomp_in_frame;
+      self.comp_in_frame <- 0;
+      self.uncomp_in_frame <- 0
     end
 
-  let should_end_frame s =
-    match s.policy with
-    | Uncompressed n -> !(s.uncomp_in_frame) >= n
-    | Compressed n -> !(s.comp_in_frame) >= n
+  let should_end_frame self : bool =
+    match self.policy with
+    | Uncompressed n -> self.uncomp_in_frame >= n
+    | Compressed n -> self.comp_in_frame >= n
     | Manual -> false
 
-  let current_frame_size s = (!(s.comp_in_frame), !(s.uncomp_in_frame))
+  let current_frame_size s = (s.comp_in_frame, s.uncomp_in_frame)
 
-  let write s buf off len =
-    if Compress_engine.is_closed s.engine then
+  let write self buf off len =
+    if Compress_engine.is_closed self.engine then
       raise (Zstd.Error "stream is closed");
     if off < 0 || len < 0 || off > Bytes.length buf - len then
       invalid_arg "Seekable.Compress.write";
     if len = 0 then ()
     else begin
-      (* Walk the input in policy-friendly chunks so the frame-size
-         policy is consulted at frequent boundaries rather than only at
-         the end of a (potentially huge) [write] call. The bound is the
-         policy target (when known) so any single chunk can at most fill
-         the remainder of the current frame; we then end the frame and
-         move on. *)
-      let chunk_cap = match s.policy with
+      (* split input in frames according to policy *)
+      let chunk_cap = match self.policy with
         | Uncompressed n -> n
         | Compressed n -> n
         | Manual -> len
@@ -110,58 +140,74 @@ module Compress = struct
       while !pos < len do
         let remaining = len - !pos in
         let chunk = min remaining (max 1 chunk_cap) in
-        Compress_engine.write s.engine buf (off + !pos) chunk;
-        s.uncomp_in_frame := !(s.uncomp_in_frame) + chunk;
+        Compress_engine.write self.engine buf (off + !pos) chunk;
+        self.uncomp_in_frame <- self.uncomp_in_frame + chunk;
         pos := !pos + chunk;
-        if should_end_frame s then force_end_frame s
+        if should_end_frame self then force_end_frame self
       done
     end
 
-  (* The seek table is metadata appended outside normal zstd frame. It must
-     bypass the wrapped writer so it does not get counted into
-     [comp_in_frame]. *)
-  let write_seek_table s =
-    let n = Buffer.length s.entries / entry_size_no_checksum in
-    let entries_size = n * entry_size_no_checksum in
-    let total_payload = entries_size + footer_size in
-    (* skippable frame header: magic + Frame_Size = total_payload *)
+  (** Emit one skippable frame. It gets its own entry if [add_to_index=true]. *)
+  let write_skippable_frame self ~magic ~add_to_index (content : bytes) off len : unit =
+    if off < 0 || len < 0 || off > Bytes.length content - len then
+      invalid_arg "Seekable.Compress: skippable frame slice out of bounds";
     let header = Bytes.create 8 in
-    bytes_set_u32_le header 0 skippable_magic;
-    bytes_set_u32_le header 4 total_payload;
-    s.user_writer header 0 8;
-    (* entries *)
-    let entries = Buffer.to_bytes s.entries in
-    if Bytes.length entries > 0 then
-      s.user_writer entries 0 (Bytes.length entries);
-    (* footer: Number_Of_Frames u32 + Seek_Table_Descriptor u8 + Seekable_Magic u32 *)
-    let footer = Bytes.create footer_size in
-    bytes_set_u32_le footer 0 n;
-    Bytes.unsafe_set footer 4 (Char.unsafe_chr 0); (* no checksum, no reserved bits *)
-    bytes_set_u32_le footer 5 seekable_magic;
-    s.user_writer footer 0 footer_size
+    bytes_set_u32_le header 0 magic;
+    bytes_set_u32_le header 4 len;
+    self.user_writer header 0 8;
+    if len > 0 then self.user_writer content off len;
+    if add_to_index then add_seektable_entry self ~comp:(8 + len) ~decomp:0
 
-  let close s =
-    if Compress_engine.is_closed s.engine then ()
-    else begin
-      if !(s.uncomp_in_frame) > 0 then force_end_frame s;
+  (** User visible version of [write_skippable_frame], with additional bound checking *)
+  let add_skippable_frame self ~magic content off_content len_content =
+    if Compress_engine.is_closed self.engine then
+      raise (Zstd.Error "stream is closed");
+    if magic < 0x184D2A50 || magic > 0x184D2A5F then
+      invalid_arg "Seekable.Compress.add_skippable_frame: magic not in \
+                   the skippable range [0x184D2A50, 0x184D2A5F]";
+    (* End any in-progress data frame first so that the order of frames in the
+       file matches the order of their seek-table entries: the skippable frame
+       is logged after the data frame it follows. A skippable frame may appear
+       anywhere (before, between, or after data frames). *)
+    if self.uncomp_in_frame > 0 then force_end_frame self;
+    write_skippable_frame self ~magic ~add_to_index:true content off_content len_content
+
+  (** The seek table is a skippable frame appended after the data
+      frames, containing concatenation of the per-frame entries and the footer. *)
+  let write_seek_table self : unit =
+    let e = self.entries in
+    let entries_size = e.len in
+    let n = entries_size / entry_size_no_checksum in
+    let total_payload = entries_size + footer_size in
+    (* Append the footer in place so the whole payload is contiguous in the
+       entries buffer, then emit it as one skippable frame.
+       footer: Number_Of_Frames u32 + Seek_Table_Descriptor u8 + Seekable_Magic u32 *)
+    Byte_buffer.ensure e footer_size;
+    bytes_set_u32_le e.bytes entries_size n;
+    Bytes.unsafe_set e.bytes (entries_size + 4) (Char.unsafe_chr 0); (* no checksum/reserved *)
+    bytes_set_u32_le e.bytes (entries_size + 5) seekable_magic;
+    e.len <- total_payload;
+    (* The seek-table frame is the one skippable frame that is not itself indexed. *)
+    write_skippable_frame self ~magic:skippable_magic ~add_to_index:false e.bytes 0 total_payload
+
+  let close self =
+    if not (Compress_engine.is_closed self.engine) then begin
+      if self.uncomp_in_frame > 0 then force_end_frame self;
       (* Use [close_no_drain] (rather than [close]) so a never-written
          engine does not emit a spurious empty zstd frame after the seek
-         table footer — that would push the last 9 bytes of the file
-         inside an empty frame and break the seekable invariant.
-         [Fun.protect] guarantees the engine is freed even if the user
-         writer raises mid-table. *)
+         table footer. *)
       Fun.protect
-        ~finally:(fun () -> Compress_engine.close_no_drain s.engine)
-        (fun () -> write_seek_table s)
+        ~finally:(fun () -> Compress_engine.close_no_drain self.engine)
+        (fun () -> write_seek_table self)
     end
 end
 
 module Decompress = struct
   module Reader = struct
     type t = {
-      read   : bytes -> int -> int -> int;
-      seek   : int -> unit;
-      length : unit -> int;
+      read : bytes -> int -> int -> int;
+      seek : int64 -> unit;       (* absolute file offset; int64 for large files *)
+      length : unit -> int64;
     }
 
     let of_string src =
@@ -175,9 +221,10 @@ module Decompress = struct
           pos := !pos + k;
           k);
         seek = (fun p ->
-          if p < 0 || p > len then invalid_arg "Seekable.Decompress.Reader.of_string: seek out of bounds";
-          pos := p);
-        length = (fun () -> len);
+          if p < 0L || p > Int64.of_int len then
+            invalid_arg "Seekable.Decompress.Reader.of_string: seek out of bounds";
+          pos := Int64.to_int p);
+        length = (fun () -> Int64.of_int len);
       }
 
     let of_in_channel ic =
@@ -193,18 +240,22 @@ module Decompress = struct
       in
       {
         read;
-        seek = (fun p -> Stdlib.seek_in ic p);
-        length = (fun () -> Stdlib.in_channel_length ic);
+        seek = (fun p -> Stdlib.LargeFile.seek_in ic p);
+        length = (fun () -> Stdlib.LargeFile.in_channel_length ic);
       }
   end
 
   type table = {
     n_frames: int;
     comp_offsets: int array;
-      (** cumulative compressed offsets, length = n_frames + 1; per-frame
-          compressed size = [comp_offsets.(i+1) - comp_offsets.(i)]. *)
+      (** absolute file offsets of frame boundaries in the compressed stream,
+          length = n_frames + 1;
+          per-frame compressed size = [comp_offsets.(i+1) - comp_offsets.(i)].
+          [comp_offsets.(0)] is the absolute start of the first data frame
+          (may be > 0 when there is skippable content before the data frames). *)
     uncomp_offsets: int array;
-    total_comp: int; (** sum of frame compressed sizes (excludes seek table) *)
+    total_comp: int; (** sum of compressed sizes over all indexed frames
+                         (data and skippable); excludes the seek-table frame *)
     total_uncomp: int;
   }
 
@@ -244,7 +295,7 @@ module Decompress = struct
     Format.fprintf fmt "@]"
 
   let read_exact (r : Reader.t) pos len =
-    r.seek pos;
+    r.seek (Int64.of_int pos);
     let b = Bytes.create len in
     let i = ref 0 in
     try
@@ -260,7 +311,9 @@ module Decompress = struct
   let[@inline] guard b = if b then Some () else None
 
   let find_table (r : Reader.t) : table option =
-    let total_len = r.length () in
+    (* Offsets are kept as [int] internally; the assert at the top of the
+       module guarantees a 64-bit runtime where that is wide enough. *)
+    let total_len = Int64.to_int (r.length ()) in
     let* () = guard (total_len >= footer_size) in
     let* footer = read_exact r (total_len - footer_size) footer_size in
     let* () = guard (u32_le_of_bytes footer 5 = seekable_magic) in
@@ -296,9 +349,16 @@ module Decompress = struct
     done;
     comp_offsets.(n) <- !cc;
     uncomp_offsets.(n) <- !cu;
-    (* Sanity: total compressed frames + skippable frame header
-       + entries + footer must equal total_len. *)
-    let* () = guard (!cc + 8 + entries_size + footer_size = total_len) in
+    (* [base] is the absolute file offset of frame 0. For files written by this
+       library, every frame (including skippable frames) is indexed in the seek
+       table, so [base = 0]. A positive [base] only arises for inputs with leading
+       bytes not covered by indexed frames (e.g., foreign/custom content); such
+       leading content is tolerated as long as it fits before the indexed frames. *)
+    let base = skippable_start - !cc in
+    let* () = guard (base >= 0) in
+    for i = 0 to n do
+      comp_offsets.(i) <- comp_offsets.(i) + base
+    done;
     Some {
       n_frames = n;
       comp_offsets; uncomp_offsets;
@@ -313,60 +373,65 @@ module Decompress = struct
     reader: Reader.t;
     scratch: bytes;
     table: table;
-    mutable uncomp_pos: int;       (* next uncompressed byte to emit, absolute *)
-    mutable skip_remaining: int;   (* bytes still to discard from decoded output *)
-    mutable comp_pos: int;         (* current absolute read position in source *)
-    comp_end: int;                 (* offset at which user data ends (= total_comp) *)
+    mutable uncomp_pos: int; (** next uncompressed byte to emit, absolute *)
+    mutable skip_remaining: int; (** bytes still to discard from decoded output *)
+    mutable comp_pos: int; (** current absolute read position in source *)
+    comp_end: int; (** absolute offset at which user data ends (= comp_offsets.(n_frames)) *)
   }
 
-  let create (reader : Reader.t) table =
+  let create (reader : Reader.t) table : t =
     let engine = E.create () in
     let scratch = Bytes.create (E.in_capacity engine) in
-    (* [reader.seek 0] runs after [E.create] has registered its GC
+    (* [reader.seek] runs after [E.create] has registered its GC
        finaliser. If [seek] raises (closed fd, IO error), tear down the
-       engine synchronously so we don't leak a dctx into the finaliser. *)
+       engine synchronously so we don't leak a dctx into the finaliser.
+       [comp_offsets.(0)] is the absolute file offset of frame 0 (may be > 0
+       when there is leading content before the data frames). *)
     try
-      reader.seek 0;
+      reader.seek (Int64.of_int table.comp_offsets.(0));
       { engine; reader; scratch; table;
         uncomp_pos = 0; skip_remaining = 0;
-        comp_pos = 0; comp_end = table.total_comp }
+        comp_pos = table.comp_offsets.(0);
+        comp_end = table.comp_offsets.(table.n_frames) }
     with exn ->
       E.close engine;
       raise exn
 
-  let is_closed s = E.is_closed s.engine
-  let close s = E.close s.engine
+  let[@inline] is_closed self = E.is_closed self.engine
+  let close self = E.close self.engine
 
-  (* Largest i such that uncomp_offsets[i] <= u, with i < n_frames. *)
-  let find_frame_for_offset (t : table) u =
+  (** Largest i such that [uncomp_offsets[i] <= off], with i < n_frames. *)
+  let find_idx_of_frame_for_offset (t : table) off : int =
     let n = t.n_frames in
     let lo = ref 0 and hi = ref (n - 1) in
     while !lo < !hi do
       let mid = (!lo + !hi + 1) / 2 in
-      if t.uncomp_offsets.(mid) <= u then lo := mid
+      if t.uncomp_offsets.(mid) <= off then lo := mid
       else hi := mid - 1
     done;
     !lo
 
-  let seek s u =
-    if E.is_closed s.engine then raise (Zstd.Error "stream is closed");
-    if u < 0 then invalid_arg "Seekable.Decompress.seek: negative offset";
-    let t = s.table in
-    E.session_reset s.engine;
-    if u >= t.total_uncomp || t.n_frames = 0 then begin
-      s.uncomp_pos <- t.total_uncomp;
-      s.skip_remaining <- 0;
-      s.comp_pos <- s.comp_end
+  (** Seek to the given uncompressed offset *)
+  let seek self target_off : unit =
+    if E.is_closed self.engine then raise (Zstd.Error "stream is closed");
+    if target_off < 0 then invalid_arg "Seekable.Decompress.seek: negative offset";
+    let t = self.table in
+    E.session_reset self.engine;
+    if target_off >= t.total_uncomp || t.n_frames = 0 then begin
+      self.uncomp_pos <- t.total_uncomp;
+      self.skip_remaining <- 0;
+      self.comp_pos <- self.comp_end
     end else begin
-      let frame = find_frame_for_offset t u in
-      s.reader.seek t.comp_offsets.(frame);
-      s.comp_pos <- t.comp_offsets.(frame);
-      s.uncomp_pos <- u;
-      s.skip_remaining <- u - t.uncomp_offsets.(frame)
+      let frame = find_idx_of_frame_for_offset t target_off in
+      self.reader.seek (Int64.of_int t.comp_offsets.(frame));
+      self.comp_pos <- t.comp_offsets.(frame);
+      self.uncomp_pos <- target_off;
+      (* skip bytes in the frame until we reach [target_off] *)
+      self.skip_remaining <- target_off - t.uncomp_offsets.(frame)
     end
 
-  let read s buf off len =
-    if E.is_closed s.engine then raise (Zstd.Error "stream is closed");
+  let read self buf off len =
+    if E.is_closed self.engine then raise (Zstd.Error "stream is closed");
     if off < 0 || len < 0 || off > Bytes.length buf - len then
       invalid_arg "Seekable.Decompress.read";
     if len = 0 then 0
@@ -376,52 +441,60 @@ module Decompress = struct
          [E.step]. Without this, exceptions leak the dctx until GC and
          trigger the 'closing in GC finalizer' warning. *)
       try
-        let t = s.table in
+        let t = self.table in
         let total = ref 0 in
         let continue = ref true in
         while !total < len && !continue do
-          if s.uncomp_pos >= t.total_uncomp then continue := false
-          else if E.pending_output s.engine > 0 then begin
-            (* Discard up to [skip_remaining] before copying anything. *)
-            if s.skip_remaining > 0 then begin
-              let dropped = E.discard s.engine s.skip_remaining in
-              s.skip_remaining <- s.skip_remaining - dropped
-            end;
-            let cap = min (len - !total) (t.total_uncomp - s.uncomp_pos) in
-            let n = E.drain s.engine buf (off + !total) cap in
-            s.uncomp_pos <- s.uncomp_pos + n;
+          if self.uncomp_pos >= t.total_uncomp then continue := false
+          else if E.pending_output self.engine > 0 then begin
+            (* Discard buffered output toward [skip_remaining] before
+               copying anything. [E.discard] only drops what is currently
+               buffered (at most one output buffer, ~ZSTD_DStreamOutSize);
+               if [skip_remaining] is larger we drop what we can and fall
+               through — [drain] then returns 0 (output is empty), the loop
+               refills/steps to produce more, and we discard again. *)
+            if self.skip_remaining > 0 then
+              self.skip_remaining <-
+                self.skip_remaining - E.discard self.engine self.skip_remaining;
+            let cap = min (len - !total) (t.total_uncomp - self.uncomp_pos) in
+            let n = E.drain self.engine buf (off + !total) cap in
+            self.uncomp_pos <- self.uncomp_pos + n;
             total := !total + n
           end else begin
-            (* Refill, bounded by the table's user-data extent — must never
-               read past it into the trailing seek table. *)
-            if E.needs_input s.engine then begin
-              let want = min (E.in_capacity s.engine) (s.comp_end - s.comp_pos) in
+            (* Refill, bounded by the table's compressed extent. Skippable
+               frames (between/around data frames) are indexed in the seek
+               table just like data frames, so [comp_end] already includes
+               them; libzstd's streaming decoder skips them transparently,
+               producing no output. We can therefore feed the input in
+               arbitrary chunks rather than one frame at a time. *)
+            if E.needs_input self.engine then begin
+              let want = min (E.in_capacity self.engine) (self.comp_end - self.comp_pos) in
               if want = 0 then begin
                 (* All compressed bytes the table promised are consumed.
                    If libzstd still wants more input ([last_ret <> 0])
                    the final frame is truncated relative to the table. *)
-                if E.last_ret s.engine <> 0 then
+                if E.last_ret self.engine <> 0 then
                   raise (Zstd.Error "truncated compressed data");
                 continue := false
               end else begin
-                let n = s.reader.read s.scratch 0 want in
+                let n = self.reader.read self.scratch 0 want in
                 if n <= 0 then raise (Zstd.Error "unexpected end of compressed input");
-                E.push_input s.engine s.scratch 0 n;
-                s.comp_pos <- s.comp_pos + n
+                E.push_input self.engine self.scratch 0 n;
+                self.comp_pos <- self.comp_pos + n
               end
             end;
             if !continue then begin
-              let (consumed, produced) = E.step s.engine in
+              let (consumed, produced) = E.step self.engine in
               (* [(0, 0)] with [last_ret = 0] just means libzstd is at a
                  clean frame boundary and the next frame's magic hasn't
                  been read yet — don't mistake it for a stall. *)
-              if produced = 0 && consumed = 0 && E.last_ret s.engine <> 0 then
+              if produced = 0 && consumed = 0 && E.last_ret self.engine <> 0 then
                 raise (Zstd.Error "decompression made no progress")
             end
           end
         done;
         !total
       with exn ->
-        E.close s.engine;
+        E.close self.engine;
         raise exn
 end
