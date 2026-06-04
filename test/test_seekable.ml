@@ -251,6 +251,112 @@ let test_seekable () =
     if got <> expected then failwith "manual: round-trip mismatch"
   in
   printf "  seekable 6. manual policy + current_frame_size: OK\n";
+
+  (* 7. Skippable frames interleaved with data frames. The seekable format
+     records every frame in the seek table (skippable frames carry a
+     decompressed size of 0), so they may appear anywhere. We embed:
+       - 2 leading skippable frames (before any data),
+       - 3 skippable frames after each content frame — the first two groups
+         sit *between* content frames, the last group is *trailing*.
+     Not all of them are empty. find_table, linear read, seek, and plain
+     [Decompress_stream] must all still recover the original data. *)
+  let () =
+    let magic = 0x184D2A50 in
+    let chunks = [ mk_data 120_000; mk_data 90_000; mk_data 17 ] in
+    let data = String.concat "" chunks in
+    (* Each group is 3 skippable frames; deliberately mix empty and non-empty. *)
+    let group tag = [ ""; sprintf "skip-%s" tag; tag ^ String.make 300 'Z' ] in
+    let leading = [ ""; "leading skippable payload" ] in
+    let buf = Buffer.create 256 in
+    let writer b o l = Buffer.add_subbytes buf b o l in
+    (* [Manual] policy: a content frame ends only when we add a skippable
+       frame (which closes the open data frame first) or close the encoder,
+       so each chunk maps to exactly one data frame. *)
+    let enc = CS.create ~frame_size:CS.Manual ~writer () in
+    let add_skips payloads =
+      List.iter (fun p ->
+        let b = Bytes.of_string p in
+        CS.add_skippable_frame enc ~magic b 0 (Bytes.length b)) payloads
+    in
+    add_skips leading;
+    List.iteri (fun i chunk ->
+      CS.write enc (Bytes.of_string chunk) 0 (String.length chunk);
+      add_skips (group (sprintf "g%d" i))
+    ) chunks;
+    CS.close enc;
+    let stream = Buffer.contents buf in
+
+    let n_data = List.length chunks in
+    let n_skip = List.length leading + (3 * List.length chunks) in
+
+    let reader = DS.Reader.of_string stream in
+    let table = match DS.find_table reader with
+      | Some t -> t
+      | None -> failwith "interleaved-skippable: find_table = None"
+    in
+    assert (DS.decompressed_size table = String.length data);
+    let nf = DS.num_frames table in
+    if nf <> n_data + n_skip then
+      failwith (sprintf "interleaved-skippable: num_frames = %d, expected %d"
+                  nf (n_data + n_skip));
+    (* Skippable frames are indexed with decompressed_size = 0; count them and
+       check their compressed size is exactly 8 + payload_len for the leading
+       ones, and that the two leading frames sit at the very front. *)
+    let zero_dsize = ref 0 in
+    for i = 0 to nf - 1 do
+      if (DS.frame_info table i).DS.decompressed = 0 then incr zero_dsize
+    done;
+    if !zero_dsize <> n_skip then
+      failwith (sprintf "interleaved-skippable: %d zero-size frames, expected %d"
+                  !zero_dsize n_skip);
+    let fi0 = DS.frame_info table 0 and fi1 = DS.frame_info table 1 in
+    assert (fi0.DS.comp_offset = 0 && fi0.DS.compressed = 8 (* empty *));
+    assert (fi1.DS.comp_offset = 8
+            && fi1.DS.compressed = 8 + String.length "leading skippable payload");
+    (* First data frame is frame 2 (after the 2 leading skippable frames). *)
+    let fd = DS.frame_info table 2 in
+    if fd.DS.decompressed <> String.length (List.nth chunks 0) then
+      failwith (sprintf "interleaved-skippable: first data frame decompressed = %d, expected %d"
+                  fd.DS.decompressed (String.length (List.nth chunks 0)));
+    if fd.DS.comp_offset <> fi1.DS.comp_offset + fi1.DS.compressed then
+      failwith "interleaved-skippable: first data frame not contiguous with leading frames";
+
+    (* linear read *)
+    let dec = DS.create reader table in
+    let got = seekable_read_all dec in
+    if got <> data then failwith "interleaved-skippable: linear read mismatch";
+    (* seek to several offsets, including frame boundaries between which
+       skippable frames live, and verify spans. *)
+    let bnd0 = String.length (List.nth chunks 0) in
+    let bnd1 = bnd0 + String.length (List.nth chunks 1) in
+    List.iter (fun u ->
+      Zstd_seekable.Decompress.seek dec u;
+      let span = 1000 in
+      let tmp = Bytes.create span in
+      let n = Zstd_seekable.Decompress.read dec tmp 0 span in
+      let expected = min span (String.length data - u) in
+      if n <> expected then
+        failwith (sprintf "interleaved-skippable: seek @%d read %d, expected %d" u n expected);
+      if Bytes.sub_string tmp 0 n <> String.sub data u n then
+        failwith (sprintf "interleaved-skippable: seek @%d span mismatch" u)
+    ) [ 0; bnd0 - 10; bnd0; bnd1 - 1; bnd1; String.length data / 2 ];
+    DS.close dec;
+    (* plain Decompress_stream also skips the interleaved skippable frames *)
+    if stream_decompress stream <> data then
+      failwith "interleaved-skippable: plain Decompress_stream mismatch";
+
+    (* Error cases: out-of-range magic, and use after close. *)
+    let enc2 = CS.create ~writer:(fun _ _ _ -> ()) () in
+    (match CS.add_skippable_frame enc2 ~magic:0x184D2A60 Bytes.empty 0 0 with
+     | exception Invalid_argument _ -> ()
+     | _ -> failwith "interleaved-skippable: out-of-range magic should raise");
+    CS.close enc2;
+    (match CS.add_skippable_frame enc2 ~magic Bytes.empty 0 0 with
+     | exception Zstd.Error _ -> ()
+     | exception _ -> failwith "interleaved-skippable: wrong exn after close"
+     | () -> failwith "interleaved-skippable: add_skippable_frame after close should raise")
+  in
+  printf "  seekable 7. interleaved skippable frames: OK\n";
   printf "All seekable tests passed.\n"
 
 ;;
