@@ -6,7 +6,7 @@
    consumer. The compressed output is discarded but counted, so we also report
    the compression ratio and the framing overhead of the seekable format.
 
-   Usage: bench_seekable [SIZE_MiB=2048] [LEVEL=3] *)
+   Usage: bench_seekable [SIZE_MiB=2048] [LEVEL=4] *)
 
 let mib = 1024 * 1024
 let chunk_bytes = 64 * 1024
@@ -21,13 +21,10 @@ let lorem =
    occaecat cupidatat non proident, sunt in culpa qui officia deserunt \
    mollit anim id est laborum."
 
-(* A 32 MiB block of pseudo-randomly ordered lorem-ipsum words, built once.
-   Its period (32 MiB) exceeds the largest frame, so neither raw nor seekable
-   finds a degenerate self-repeat: every frame is realistic ~text-compressible
-   input rather than one giant match. *)
+(* A 32 MiB block of pseudo-randomly ordered lorem-ipsum words, built once. *)
 let source_size = 32 * mib
 
-let pattern = lazy begin
+let pattern = begin
   let words =
     String.split_on_char ' ' lorem
     |> List.filter (fun w -> w <> "")
@@ -57,7 +54,7 @@ end
    [consume] in 64 KiB chunks. The chunk buffer is reused, so [consume] must
    use the bytes before returning (both compressors copy synchronously). *)
 let source ~total consume: unit =
-  let src = Lazy.force pattern in
+  let src = pattern in
   let slen = Bytes.length src in
   let chunk = Bytes.create chunk_bytes in
   let sp = ref 0 in
